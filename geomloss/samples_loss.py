@@ -1,8 +1,7 @@
 import torch
 from torch.nn import Module
 from functools import partial
-import warnings
-
+import warnings, logging
 from .kernel_samples import kernel_tensorized, kernel_online, kernel_multiscale
 
 from .sinkhorn_samples import sinkhorn_tensorized
@@ -41,8 +40,151 @@ routines = {
         "multiscale" : partial( kernel_multiscale, name="laplacian" ),
     },
 }
+def tv(x):
+    return torch.abs(x -1 )
+def dualtv(y):
+    return y
 
+def dualkl2(y):
+    return torch.exp(y )-1
+def xlnx2(x,lambda1 = 1.0):
+    return (torch.xlogy(x,x) - x + 1)
+from functools import partial
 
+class uot_sinkhorn():
+    def __init__(self, max_iter = 100,
+                 ep = 5e-2,interval = 20, epsilon = 0.01, device = None, phi1 = "kl", phi2 = "kl") -> None:
+        self.epsilon = epsilon
+        if phi1 == "kl":
+            self.phi1 = xlnx2
+            self.phi1_star = dualkl2
+        elif phi1 == "tv":
+            self.phi1 = tv
+            self.phi1_star = dualtv
+        if phi2 == "kl":   
+            self.phi2 = xlnx2
+            self.phi2_star = dualkl2
+        self.rec = [phi1, phi2]
+        self.epsilon = epsilon
+        self.device = device
+        self.max_iter = max_iter
+        self.ep = ep
+        self.interval = interval
+    # kl
+    def update(self, a, b, f):
+        g_uot = self.epsilon*(torch.log(b) - torch.log(torch.exp(f/self.epsilon)@(self.K)))/(1+self.epsilon)
+        f_uot = self.epsilon*(torch.log(a) - torch.log(torch.exp(g_uot/self.epsilon)@(self.K.T)))/(1+self.epsilon)
+        return g_uot, f_uot
+    # # tv
+    # def update(self, a, b, f):
+    #     g_uot = self.epsilon*(torch.log(b) - torch.log(torch.exp(f/self.epsilon)@(self.K)))
+    #     f_uot = self.epsilon*(torch.log(a) - torch.log(torch.exp(g_uot/self.epsilon)@(self.K.T)))
+    #     g_uot.clamp_(min = -1, max = None)
+    #     f_uot.clamp_(min = -1, max = None)
+    #     return g_uot, f_uot
+
+    def solver(self, a,b,K,init = None):
+        if init is None : 
+            f = torch.zeros((a.shape[0],self.K.shape[0]),dtype=torch.float32, device= self.device)
+        else:
+            f = init
+        self.K = K
+        for i in range(self.max_iter):
+            g,f = self.update(a,b,f)
+            g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+            f = torch.km (f, nan=0.0, posinf=0.0, neginf=0.0)
+            if i > 0:
+                f_expand = f.unsqueeze(2)
+                g_expand = g.unsqueeze(1)
+                P = torch.matmul(torch.exp(f_expand/self.epsilon), torch.exp(g_expand/self.epsilon))*self.K
+                del f_expand,g_expand
+                b0 = P.sum(dim = 1, keepdim = True).squeeze()
+                del P
+                if self.rec[0] == "kl":
+                    norm2 = torch.norm((b0 - b*torch.exp(-g)),dim = 1,keepdim=True)
+                elif self.rec[0] == "tv":
+                    norm2 = torch.norm((b0 - b),dim = 1,keepdim=True)
+                cond = torch.sum(norm2) < self.ep
+                print("iter",i,torch.sum(norm2))
+                if  cond:
+                    logging.info("quit",i)
+                    return g,f
+        logging.info("quit",self.max_iter)
+        return g,f
+    def dual_obj_from_f(self, a, b, f):
+        g_sink, f_sink = self.update(a, b, f)
+
+        dual_obj_left = - torch.sum(self.phi1_star(-f_sink) * a, dim=-1) - torch.sum(self.phi2_star(-g_sink) * b, dim=-1)
+        dual_obj_right = - self.epsilon*torch.sum(torch.exp(f_sink/self.epsilon)*(torch.exp(g_sink/self.epsilon)@(self.K.T)), dim = -1)
+        dual_obj = dual_obj_left + dual_obj_right
+        return dual_obj, g_sink, f_sink
+    def __call__(self, a, b, f_pred):
+        dual_value,g_s,f_s = self.dual_obj_from_f(a, b, f_pred)
+        if self.rec[1] == "kl":
+            gradg = b*torch.exp(-g_s) - torch.exp(g_s/self.epsilon)*(torch.exp(f_s/self.epsilon)@(self.K))
+        elif self.rec[1] == "tv":
+            gradg = b - torch.exp(g_s/self.epsilon)*(torch.exp(f_s/self.epsilon)@(self.K))
+        norm2 = torch.norm(gradg,dim = 1,keepdim=True).mean()
+        loss =  - torch.mean(dual_value) + norm2
+        return loss
+class ot_sinkhorn():
+    def __init__(self,  epsilon = 0.01, device = None, max_iter = 100, ep = 5e-2,
+                 interval = 20) -> None:
+        self.epsilon = epsilon
+        self.device = device
+        self.max_iter = max_iter
+        self.ep = ep
+        self.interval = interval
+        
+    def update(self, a, b, f):
+        g_uot = self.epsilon*(torch.log(b) - torch.log(torch.exp(f/self.epsilon)@(self.K)))
+        f_uot = self.epsilon*(torch.log(a) - torch.log(torch.exp(g_uot/self.epsilon)@(self.K.T)))
+        return g_uot, f_uot      
+
+    def solver(self, a,b,K,init = None):
+        if init is None : 
+            f = torch.zeros((a.shape[0],self.K.shape[0]),dtype=torch.float32, device= self.device)
+        else:
+            f = init
+        self.K = K
+        for i in range(self.max_iter):
+            g,f = self.update(a,b,f)           
+            if i > 0 and i % self.interval == 0:
+                f_expand = f.unsqueeze(2)
+                g_expand = g.unsqueeze(1)
+                P = torch.matmul(torch.exp(f_expand/self.epsilon), torch.exp(g_expand/self.epsilon))*self.K
+                del f_expand,g_expand
+                b0 = P.sum(dim = 1, keepdim = True).squeeze()
+                del P
+                norm2 = torch.norm((b0 - b),dim = 1,keepdim=True)
+                print(torch.sum(norm2))
+                cond = torch.sum(norm2) < self.ep
+                if  cond:
+                    print("quit at iter: ",i)
+                    return g.detach(),f.detach()
+                del norm2, cond
+                torch.cuda.empty_cache()
+
+        torch.cuda.empty_cache()
+        print("quit at iter: ",self.max_iter)
+
+        return g.detach(),f.detach()
+    def dual_obj_from_f(self, a, b, f):
+        g_sink, f_sink = self.update(a, b, f)
+        if (g_sink == torch.nan).any() or (f_sink == torch.nan).any():
+            print("error")
+        g_sink_nan = torch.nan_to_num(g_sink, nan=0.0, posinf=0.0, neginf=0.0)
+        f_sink_nan = torch.nan_to_num(f_sink, nan=0.0, posinf=0.0, neginf=0.0)
+        dual_obj_left = torch.sum(f_sink_nan * a, dim=-1) + torch.sum(g_sink_nan * b, dim=-1)
+        dual_obj_right = - self.epsilon*torch.sum(torch.exp(f_sink/self.epsilon)*(torch.exp(g_sink/self.epsilon)@(self.K.T)), dim = -1)
+        dual_obj = dual_obj_left + dual_obj_right
+        return dual_obj, g_sink, f_sink
+    def __call__(self, a, b, f_pred):
+        dual_value,g_s,f_s = self.dual_obj_from_f(a, b, f_pred)
+        gradg = b - torch.exp(g_s/self.epsilon)*(torch.exp(f_s/self.epsilon)@(self.K))
+        norm2 = torch.norm(gradg,dim = 1,keepdim=True).mean()
+        loss =  - torch.mean(dual_value) + norm2
+        return loss
 class SamplesLoss(Module):
     """Creates a criterion that computes distances between sampled measures on a vector space.
 

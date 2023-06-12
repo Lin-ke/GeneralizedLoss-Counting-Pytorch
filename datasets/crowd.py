@@ -127,5 +127,11 @@ class Crowd(data.Dataset):
         else:
             if random.random() > 0.5:
                 img = F.hflip(img)
+        k = np.zeros(shape=(h,w))
+        idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] <= w) * \
+                   (keypoints[:, 1] >= 0) * (keypoints[:, 1] <= h)
+        keypoints = keypoints[idx_mask]
+        for i in range(0, len(keypoints)):
+            k[int(keypoints[i][1]), int(keypoints[i][0])] = 1
         return self.trans(img), torch.from_numpy(keypoints.copy()).float(), \
-               torch.from_numpy(target.copy()).float(), st_size
+               torch.from_numpy(k.copy()).float(), st_size

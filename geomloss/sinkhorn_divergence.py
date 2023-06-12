@@ -61,7 +61,7 @@ def epsilon_schedule(p, diameter, blur, scaling):
         + [ blur**p ]
     return ε_s
 
-
+#rho =  0.5^p, p =1 or 2
 def scaling_parameters( x, y, p, blur, reach, diameter, scaling):
 
     if diameter is None:

@@ -16,4 +16,4 @@ class MLP(nn.Module):
         x = torch.cat((a, b), dim = -1)
         for L, A in self.model_base:
             x = A(L(x))
-        return torch.abs(self.lin(x))
+        return self.lin(x)

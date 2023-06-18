@@ -20,8 +20,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from models.vgg import vgg19
 from models.mlp import MLP
 from datasets.crowd import Crowd, train_val, get_im_list
-from geomloss import SamplesLoss, ot_sinkhorn, uot_sinkhorn
+from geomloss import SamplesLoss
 import inspect
+M_EPS = 1e-16
 
 print(inspect.getfile(SamplesLoss))
 
@@ -113,8 +114,7 @@ class EMDTrainer(Trainer):
        
         self.blur = args.blur
         # debias: UOT, 
-        #self.criterion = SamplesLoss(blur=args.blur, scaling=args.scaling, debias=False, backend='tensorized', cost=self.cost, reach=args.reach, p=args.p)
-        self.criterion = uot_sinkhorn(device = self.device,epsilon=self.blur)
+        self.criterion = SamplesLoss(blur=args.blur, scaling=args.scaling, debias=False, backend='tensorized', cost=self.cost, reach=args.reach, p=args.p)
         self.log_dir = os.path.join('./runs', args.save_dir.split('/')[-1]) 
         self.writer = SummaryWriter(self.log_dir)
 
@@ -130,13 +130,13 @@ class EMDTrainer(Trainer):
         grid_size = self.args.crop_size // self.args.downsample_ratio
         self.cood_grid = grid(grid_size,grid_size,1).unsqueeze(0) * self.args.downsample_ratio + (self.args.downsample_ratio / 2)
         self.cood_grid = self.cood_grid.type(torch.cuda.FloatTensor) / float(self.args.crop_size)
-        self.costmat = self.cost(self.cood_grid, self.cood_grid)
-        self.gt_encoder = torch.nn.AvgPool2d(kernel_size=self.args.downsample_ratio,stride=self.args.downsample_ratio).to(self.device)
         # output:[batch, 1(channel), h/downsample_ratio, w/downsample_ratio]
         shape = self.args.crop_size // self.args.downsample_ratio #(64)
         self.pred_net = MLP(2*shape**2, shape**2).to(self.device) # (input:shape**2(est count) + shape**2(gt count), output:shape(vector a))
         self.pred_optim = torch.optim.Adam(self.pred_net.parameters(), lr = 1e-3)
-    
+        self.rho =  None if args.reach is None else args.reach**args.p
+        self.coeff = self.rho*args.blur/(args.blur+self.rho)
+        self.blur = self.epsilon = args.blur
     def train(self):
         """training process"""
         args = self.args
@@ -166,15 +166,14 @@ class EMDTrainer(Trainer):
             st_sizes = st_sizes.to(self.device)
             gd_count = np.array([len(p) for p in points], dtype=np.float32)
             points = [p.to(self.device) for p in points]
-            targets = self.gt_encoder(targets.to(self.device)).reshape(targets.shape[0],-1)
+            targets = targets.to(self.device).reshape(targets.shape[0],-1)
             # targets now is gt count(after downsample)
             shape = (inputs.shape[0],int(inputs.shape[2]/self.args.downsample_ratio),int(inputs.shape[3]/self.args.downsample_ratio))
 
             with torch.autograd.set_grad_enabled(True):
 
                 outputs = self.model(inputs)
-               
-                
+
                 i = 0
                 emd_loss = 0
                 point_loss = 0
@@ -187,35 +186,50 @@ class EMDTrainer(Trainer):
                         pixel_loss += torch.abs(gt.sum() - outputs[i].sum()) / shape[0]
                         emd_loss += torch.abs(gt.sum() - outputs[i].sum()) / shape[0]
                     else:
-                        gt = torch.ones((1, len(p))).to(self.device) # target count (actually some are at the same position)
-                        cood_points = p.reshape(1, -1, 2) / float(self.args.crop_size) # 
-                        A = outputs[i].reshape(1, -1).to(self.device) # est count
+                        gt = torch.ones((1, len(p), 1)).cuda()
+                        
+                        cood_points = p.reshape(1, -1, 2) / float(self.args.crop_size) 
+                        A = outputs[i].reshape(1, -1, 1)
+                        A_ = A.squeeze(-1).detach()
+                        targets_ = targets[i].unsqueeze(0)
+
                         C = self.cost(self.cood_grid, cood_points)
+                        self.K = torch.exp(-C/self.epsilon).squeeze(0)
+                        # 推理 + 计算
                         start_time = time.time()
-                        K = torch.exp(-C).squeeze(0)
-                        F_pred = self.pred_net(A,targets[i].unsqueeze(0))
-                        G,F = self.criterion.solver(a = A, b =  gt, K = K, init = F_pred)
+                        F_pred = self.pred_net(A_,targets_)
+                        
+
+                        l, F, G = self.criterion(A, self.cood_grid, gt, cood_points,F_pred.unsqueeze(-1).detach())
                         end_time = time.time()
-                        #logging.info("emd time with init: {}".format(end_time-start_time))
+                        logging.info("emd time with init: {}".format(end_time-start_time))
                         start_time = time.time()
-                        G,F = self.criterion.solver(a = A, b =  gt, K = K, init = None)
-                        end_time = time.time()
-                        #logging.info("emd time without init: {}".format(end_time-start_time))
-                        pred_loss = self.criterion(a = A, b= gt, f_pred = F_pred)
-                        # optimize pred_net:
-                        for j in range(3):
+                        pred_loss = self.potential_loss(a = A_ ,b = gt.squeeze(-1), f_pred = F_pred)
+
+                        for j in range(1):
+                            if j != 0:
+                                F_pred = self.pred_net(A_,targets_)
+                            pred_loss = self.potential_loss(a = A_ ,b = gt.squeeze(-1), f_pred = F_pred)
+                            
                             self.pred_optim.zero_grad()
-                            pred_loss.backward(retain_graph = True)
-                            F_pred = self.pred_net(A,targets[i].unsqueeze(0))
-                            pred_loss = self.criterion(a = A, b= gt, f_pred = F_pred)
-                       
-                        PI = torch.exp((F.unsqueeze(2)+G.unsqueeze(1)-C)
-                                       .detach()/self.args.blur**self.args.p)*A.unsqueeze(2)*gt.unsqueeze(1) #1,64,1*1,1,len(gt)
+                            pred_loss.backward()
+                            self.pred_optim.step()
+                            
+                        end_time = time.time()
+                        logging.info("optmize time: {}".format(end_time-start_time))
+                        
+                        # 直接Sinkhorn
+                        start_time = time.time()
+                        l, F, G = self.criterion(A, self.cood_grid, gt, cood_points,None)
+                        end_time = time.time()
+                        logging.info("emd time without init: {}".format(end_time-start_time))
+                        
+                        
+                        PI = torch.exp((F.repeat(1,1,C.shape[2])+G.permute(0,2,1).repeat(1,C.shape[1],1)-C).detach()/self.args.blur**self.args.p)*A*gt.permute(0,2,1)
                         entropy += torch.mean((1e-20+PI) * torch.log(1e-20+PI))
-                        assert C.shape == PI.shape
-                        assert not (torch.isnan(PI).any().item())
-                        l = (C*PI).sum()
-                        emd_loss = l/shape[0]
+                        AE = PI
+                        AE = AE.sum(1).reshape(1,-1,1)
+                        emd_loss += (torch.mean(l) / shape[0])
                         if self.args.d_point == 'l1':
                             point_loss += torch.sum(torch.abs(PI.sum(1).reshape(1,-1,1)-gt)) / shape[0] 
                         else:
@@ -224,7 +238,6 @@ class EMDTrainer(Trainer):
                             pixel_loss += torch.sum(torch.abs(PI.sum(2).reshape(1,-1,1).detach()-A)) / shape[0] 
                         else:
                             pixel_loss += torch.sum((PI.sum(2).reshape(1,-1,1).detach()-A)**2) / shape[0] 
-                        
                     i += 1
 
                 loss = emd_loss + self.args.tau*(pixel_loss + point_loss) + self.blur*entropy
@@ -299,6 +312,26 @@ class EMDTrainer(Trainer):
         # print log info
         logging.info('Val: Best Epoch {} Val, MSE: {:.2f} MAE: {:.2f}, Cost {:.1f} sec'
                      .format(self.best_epoch['val'], self.best_mse['val'], self.best_mae['val'], time.time()-epoch_start))
-
-
-
+    def dualkl(self,y):
+        return self.rho*(torch.exp(y/self.rho)- 1)
+    
+    def update(self, a, b, f):
+            g_uot = self.coeff*(torch.log(torch.div(b,torch.exp(f/self.epsilon)@(self.K)+M_EPS)))
+            f_uot = self.coeff*(torch.log(torch.div(a,torch.exp(g_uot/self.epsilon)@(self.K.T) + M_EPS)))
+            return g_uot, f_uot   
+    def dual_obj_from_f(self, a, b, f):
+        g_sink, f_sink = self.update(a, b, f)
+        if torch.any(torch.isnan(g_sink)) or torch.any(torch.isnan(f_sink)):
+            print('Warning: numerical errors')
+        g_sink_nan = torch.nan_to_num(g_sink, nan=0.0, posinf=0.0, neginf=0.0)
+        f_sink_nan = torch.nan_to_num(f_sink, nan=0.0, posinf=0.0, neginf=0.0)
+        dual_obj_left = - torch.sum(self.dualkl(-f_sink_nan) * a, dim=-1) - torch.sum(self.dualkl(-g_sink_nan) * b, dim=-1)
+        dual_obj_right = - self.epsilon*torch.sum(torch.exp(f_sink/self.epsilon)*(torch.exp(g_sink/self.epsilon)@(self.K.T)), dim = -1)
+        dual_obj = dual_obj_left + dual_obj_right
+        return dual_obj, g_sink, f_sink
+    def potential_loss(self, a, b, f_pred):
+        dual_value,g_s,f_s = self.dual_obj_from_f(a+M_EPS, b+M_EPS, f_pred)
+        gradg = b*torch.exp(-g_s/self.rho) - torch.exp(g_s/self.epsilon)*(torch.exp(f_s/self.epsilon)@(self.K))
+        norm2 = torch.norm(gradg,dim = 1,keepdim=True).mean()
+        loss =  - torch.mean(dual_value) + norm2
+        return loss

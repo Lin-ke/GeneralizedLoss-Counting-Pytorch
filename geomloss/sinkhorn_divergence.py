@@ -84,6 +84,7 @@ def dampening(ε, ρ):
 
 def log_weights(α):
     α_log = α.log()
+    # nan -> -100000
     α_log[α <= 0] = -100000
     return α_log
 
@@ -125,7 +126,7 @@ def sinkhorn_cost(ε, ρ, α, β, a_x, b_y, a_y, b_x, batch=False, debias=True, 
 
 def sinkhorn_loop( softmin, α_logs, β_logs, C_xxs, C_yys, C_xys, C_yxs, ε_s, ρ, 
                    jumps=[], kernel_truncation=None, truncate=5, cost=None,
-                   extrapolate=None, debias=True, last_extrapolation=True ):
+                   extrapolate=None, debias=True, last_extrapolation=True,warm_up = None ):
     
     Nits = len(ε_s)
     if type(α_logs) is not list:
@@ -153,9 +154,9 @@ def sinkhorn_loop( softmin, α_logs, β_logs, C_xxs, C_yys, C_xys, C_yxs, ε_s, 
     #a_y = λ * softmin(ε, C_yx, -β_log )  # OT(α,β) wrt. a
     #b_x = λ * softmin(ε, C_xy, -α_log )  # OT(α,β) wrt. b
     a_y = λ * softmin(ε, C_yx, α_log )  # OT(α,β) wrt. a
-    b_x = λ * softmin(ε, C_xy, β_log )  # OT(α,β) wrt. b
-
-    #print(len(ε_s))
+    if warm_up is not None:
+        b_x = warm_up
+    else:b_x = λ * softmin(ε, C_xy, β_log )  # OT(α,β) wrt. b
     for i, ε in enumerate(ε_s):  # ε-scaling descent -----------------------
 
         λ = dampening(ε, ρ)  # ε has changed, so we should update λ too!

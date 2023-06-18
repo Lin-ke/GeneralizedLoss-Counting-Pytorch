@@ -46,10 +46,11 @@ def sinkhorn_tensorized(α, x, β, y, p=2, blur=.05, reach=None, diameter=None, 
 
 
     diameter, ε, ε_s, ρ = scaling_parameters( x, y, p, blur, reach, diameter, scaling )
-
+    # e_s 是 list: [diameter,...,e]
     a_x, b_y, a_y, b_x = sinkhorn_loop( softmin_tensorized, 
                                         log_weights(α), log_weights(β), 
-                                        C_xx, C_yy, C_xy, C_yx, ε_s, ρ, debias=debias )
+                                        C_xx, C_yy, C_xy, C_yx, ε_s, ρ, debias=debias,
+                                        warm_up=kwargs["warm_up"])
 
     return sinkhorn_cost(ε, ρ, α, β, a_x, b_y, a_y, b_x, batch=True, debias=debias, potentials=potentials)
 

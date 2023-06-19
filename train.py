@@ -20,6 +20,8 @@ def parse_args():
                         help='reach')
     parser.add_argument('--blur', type=float, default=0.01,
                         help='blur')
+    parser.add_argument('--epsilon', type=float, default=10,
+                        help='used in prednet')
     parser.add_argument('--scaling', type=float, default=0.5,
                         help='scaling')
     parser.add_argument('--tau', type=float, default=0.1,

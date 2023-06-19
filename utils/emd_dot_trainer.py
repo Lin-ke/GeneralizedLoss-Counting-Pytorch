@@ -40,9 +40,10 @@ def per_cost(X, Y):
     y_lin = Y.unsqueeze(-3)
     C = torch.sum((torch.abs(x_col - y_lin)) ** 2, -1)
     C = torch.sqrt(C)
-    s = (x_col[:,:,:,-1] + y_lin[:,:,:,-1]) / 2
-    s = s * 0.2 + 0.5
-    return (torch.exp(C/s) - 1)
+    # s = (x_col[:,:,:,-1] + y_lin[:,:,:,-1]) / 2
+    # s = s * 0.2 + 0.5
+    # return (torch.exp(C/s) - 1)
+    return C
 
 def exp_cost(X, Y):
     x_col = X.unsqueeze(-2)
@@ -135,8 +136,11 @@ class EMDTrainer(Trainer):
         self.pred_net = MLP(2*shape**2, shape**2).to(self.device) # (input:shape**2(est count) + shape**2(gt count), output:shape(vector a))
         self.pred_optim = torch.optim.Adam(self.pred_net.parameters(), lr = 1e-3)
         self.rho =  None if args.reach is None else args.reach**args.p
-        self.coeff = self.rho*args.blur/(args.blur+self.rho)
-        self.blur = self.epsilon = args.blur
+        
+        self.blur = args.blur
+        # Prednet实际解决的是更Blur（10）的问题
+        self.epsilon = args.epsilon
+        self.coeff = self.rho*self.epsilon/(self.epsilon+self.rho)
     def train(self):
         """training process"""
         args = self.args
@@ -194,7 +198,9 @@ class EMDTrainer(Trainer):
                         targets_ = targets[i].unsqueeze(0)
 
                         C = self.cost(self.cood_grid, cood_points)
-                        self.K = torch.exp(-C/self.epsilon).squeeze(0)
+
+                        self.K = torch.exp(torch.div(C, -self.epsilon)).squeeze(0)
+
                         # 推理 + 计算
                         start_time = time.time()
                         F_pred = self.pred_net(A_,targets_)
@@ -203,9 +209,8 @@ class EMDTrainer(Trainer):
                         l, F, G = self.criterion(A, self.cood_grid, gt, cood_points,F_pred.unsqueeze(-1).detach())
                         end_time = time.time()
                         logging.info("emd time with init: {}".format(end_time-start_time))
+                        
                         start_time = time.time()
-                        pred_loss = self.potential_loss(a = A_ ,b = gt.squeeze(-1), f_pred = F_pred)
-
                         for j in range(1):
                             if j != 0:
                                 F_pred = self.pred_net(A_,targets_)
@@ -316,21 +321,23 @@ class EMDTrainer(Trainer):
         return self.rho*(torch.exp(y/self.rho)- 1)
     
     def update(self, a, b, f):
-            g_uot = self.coeff*(torch.log(torch.div(b,torch.exp(f/self.epsilon)@(self.K)+M_EPS)))
-            f_uot = self.coeff*(torch.log(torch.div(a,torch.exp(g_uot/self.epsilon)@(self.K.T) + M_EPS)))
-            return g_uot, f_uot   
+        g_uot = self.coeff*(torch.log(torch.div(b,torch.exp(f/self.epsilon)@(self.K))+M_EPS))
+        f_uot = self.coeff*(torch.log(torch.div(a,torch.exp(g_uot/self.epsilon)@(self.K.T))+M_EPS))
+        return g_uot, f_uot   
     def dual_obj_from_f(self, a, b, f):
         g_sink, f_sink = self.update(a, b, f)
         if torch.any(torch.isnan(g_sink)) or torch.any(torch.isnan(f_sink)):
             print('Warning: numerical errors')
         g_sink_nan = torch.nan_to_num(g_sink, nan=0.0, posinf=0.0, neginf=0.0)
         f_sink_nan = torch.nan_to_num(f_sink, nan=0.0, posinf=0.0, neginf=0.0)
+            
+
         dual_obj_left = - torch.sum(self.dualkl(-f_sink_nan) * a, dim=-1) - torch.sum(self.dualkl(-g_sink_nan) * b, dim=-1)
-        dual_obj_right = - self.epsilon*torch.sum(torch.exp(f_sink/self.epsilon)*(torch.exp(g_sink/self.epsilon)@(self.K.T)), dim = -1)
+        dual_obj_right = - self.epsilon*torch.sum(torch.exp(f_sink_nan/self.epsilon)*(torch.exp(g_sink_nan/self.epsilon)@(self.K.T)), dim = -1)
         dual_obj = dual_obj_left + dual_obj_right
         return dual_obj, g_sink, f_sink
     def potential_loss(self, a, b, f_pred):
-        dual_value,g_s,f_s = self.dual_obj_from_f(a+M_EPS, b+M_EPS, f_pred)
+        dual_value,g_s,f_s = self.dual_obj_from_f(a, b, f_pred)
         gradg = b*torch.exp(-g_s/self.rho) - torch.exp(g_s/self.epsilon)*(torch.exp(f_s/self.epsilon)@(self.K))
         norm2 = torch.norm(gradg,dim = 1,keepdim=True).mean()
         loss =  - torch.mean(dual_value) + norm2
